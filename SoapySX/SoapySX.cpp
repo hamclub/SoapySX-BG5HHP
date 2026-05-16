@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <climits>
 #include <chrono>
+#include <complex>
 #include <cmath>
 #include <fstream>
 #include <iomanip>
@@ -93,6 +94,15 @@ static unsigned parse_unsigned_setting(const std::string &value, unsigned min_va
     return parsed;
 }
 
+static float parse_correction_setting(const std::string &value)
+{
+    double parsed = std::stod(value);
+    if (!std::isfinite(parsed) || std::abs(parsed) > 1.0) {
+        throw std::runtime_error("Correction value must be finite and within +/-1.0");
+    }
+    return (float)parsed;
+}
+
 struct hat_info {
     uint16_t product_id;
     uint16_t product_ver;
@@ -122,14 +132,31 @@ static struct hat_info read_hat_info(void)
 
 // Convert raw received samples to CF32.
 // TODO: Support other formats and add format as a parameter.
-static inline void convert_rx_buffer(const void *src, size_t src_offset, void *dest, size_t dest_offset, size_t length)
+static inline void convert_rx_buffer(
+    const void *src,
+    size_t src_offset,
+    void *dest,
+    size_t dest_offset,
+    size_t length,
+    float dc_i,
+    float dc_q,
+    std::complex<float> iq_coeff
+)
 {
     const int32_t *src_ = (const int32_t*)src + src_offset*2;
     float *dest_ = (float*)dest + dest_offset*2;
     const float scaling = 1.0f / 0x80000000L;
-    for (size_t i = 0; i < length*2; i++)
+    const float coeff_i = iq_coeff.real();
+    const float coeff_q = iq_coeff.imag();
+
+    for (size_t i = 0; i < length*2; i += 2)
     {
-        dest_[i] = scaling * (float)src_[i];
+        const float in_i = scaling * (float)src_[i] - dc_i;
+        const float in_q = scaling * (float)src_[i + 1] - dc_q;
+
+        // Correct image leakage as y = x + c * conj(x).
+        dest_[i] = in_i + coeff_i * in_i + coeff_q * in_q;
+        dest_[i + 1] = in_q + coeff_q * in_i - coeff_i * in_q;
     }
 }
 
@@ -160,6 +187,9 @@ static inline void convert_tx_buffer(const void *src, size_t src_offset, void *d
 
 #define MAX_REGS 0x80
 
+#define SX1255_REG_TXFE2 0x0A
+#define SX1255_REG_TXFE3 0x0B
+#define SX1255_REG_RXFE2 0x0D
 #define SX1255_REG_RXFE3 0x0E
 #define SX1255_TEMP_DEFAULT_REF_C 25.0
 #define SX1255_TEMP_DEFAULT_REF_RAW 150.0
@@ -585,6 +615,10 @@ private:
     unsigned temperature_samples;
     unsigned temperature_shift;
     std::string pa_mode;
+    mutable std::mutex rx_correction_mutex;
+    float rx_dc_i;
+    float rx_dc_q;
+    std::complex<float> rx_iq_balance;
 
     // Values of registers (to be) written to the chip.
     // Storing them here makes it easier and faster to change
@@ -797,6 +831,57 @@ private:
         return { qout_mean, raw_code };
     }
 
+    void set_filter_profile(const std::string &profile)
+    {
+        if (profile == "TETRA_CLEAN") {
+            // Keep hardware filters much wider than a 25 kHz TETRA channel.
+            // FlowStation's DSP defines the occupied channel; these settings
+            // reduce wideband TX DAC/image energy without live gain changes.
+            set_register_bits(SX1255_REG_TXFE2, 0, 5, 0);
+            set_register_bits(SX1255_REG_TXFE3, 0, 3, 5);
+            set_register_bits(SX1255_REG_RXFE2, 5, 3, 1);
+            set_register_bits(SX1255_REG_RXFE2, 2, 3, 6);
+            set_register_bits(SX1255_REG_RXFE2, 0, 2, 3);
+            write_registers_to_chip(SX1255_REG_TXFE2, 2);
+            write_registers_to_chip(SX1255_REG_RXFE2, 1);
+        } else if (profile == "LEGACY") {
+            set_register_bits(SX1255_REG_TXFE2, 0, 5, 16);
+            set_register_bits(SX1255_REG_TXFE3, 0, 3, 2);
+            set_register_bits(SX1255_REG_RXFE2, 5, 3, 1);
+            set_register_bits(SX1255_REG_RXFE2, 2, 3, 6);
+            set_register_bits(SX1255_REG_RXFE2, 0, 2, 3);
+            write_registers_to_chip(SX1255_REG_TXFE2, 2);
+            write_registers_to_chip(SX1255_REG_RXFE2, 1);
+        } else {
+            throw std::runtime_error("Unsupported RF profile");
+        }
+    }
+
+    std::string get_filter_profile(void) const
+    {
+        const unsigned tx_filter_bw = get_cached_register_bits(SX1255_REG_TXFE2, 0, 5);
+        const unsigned tx_dac_bw = get_cached_register_bits(SX1255_REG_TXFE3, 0, 3);
+        const unsigned rx_adc_bw = get_cached_register_bits(SX1255_REG_RXFE2, 5, 3);
+        const unsigned rx_adc_trim = get_cached_register_bits(SX1255_REG_RXFE2, 2, 3);
+        const unsigned rx_pga_bw = get_cached_register_bits(SX1255_REG_RXFE2, 0, 2);
+
+        if (tx_filter_bw == 0 && tx_dac_bw == 5 && rx_adc_bw == 1 && rx_adc_trim == 6 && rx_pga_bw == 3)
+            return "TETRA_CLEAN";
+        if (tx_filter_bw == 16 && tx_dac_bw == 2 && rx_adc_bw == 1 && rx_adc_trim == 6 && rx_pga_bw == 3)
+            return "LEGACY";
+        return "CUSTOM";
+    }
+
+    void validate_rx_correction_channel(const int direction, const size_t channel) const
+    {
+        if (direction != SOAPY_SDR_RX) {
+            throw std::runtime_error("RX correction is only supported for RX direction");
+        }
+        if (channel != 0) {
+            throw std::runtime_error("Invalid RX correction channel");
+        }
+    }
+
 /***********************************************************************
  * Initialization and destruction
  **********************************************************************/
@@ -837,6 +922,9 @@ public:
         temperature_samples(SX1255_TEMP_DEFAULT_SAMPLES),
         temperature_shift(SX1255_TEMP_DEFAULT_SHIFT),
         pa_mode("AUTO"),
+        rx_dc_i(0.0f),
+        rx_dc_q(0.0f),
+        rx_iq_balance(0.0f, 0.0f),
         regs{0},
 
         // Allocate reasonably large buffers by default.
@@ -1092,7 +1180,16 @@ public:
 
                 assert((size_t)samples_read <= buffer_rx.size());
                 assert((size_t)samples_read <= numElems);
-                convert_rx_buffer(buffer_rx.data(), 0, buffs[0], 0, samples_read);
+                float dc_i;
+                float dc_q;
+                std::complex<float> iq_balance;
+                {
+                    std::scoped_lock correction_lock(rx_correction_mutex);
+                    dc_i = rx_dc_i;
+                    dc_q = rx_dc_q;
+                    iq_balance = rx_iq_balance;
+                }
+                convert_rx_buffer(buffer_rx.data(), 0, buffs[0], 0, samples_read, dc_i, dc_q, iq_balance);
 
                 return (int)samples_read;
             } else {
@@ -1338,6 +1435,61 @@ public:
         }
 
         return "nan";
+    }
+
+/***********************************************************************
+ * RX correction
+ **********************************************************************/
+
+    bool hasDCOffset(const int direction, const size_t channel) const override
+    {
+        (void)channel;
+        return direction == SOAPY_SDR_RX && channel == 0;
+    }
+
+    void setDCOffset(const int direction, const size_t channel, const std::complex<double> &offset) override
+    {
+        validate_rx_correction_channel(direction, channel);
+        if (!std::isfinite(offset.real()) || !std::isfinite(offset.imag()) ||
+            std::abs(offset.real()) > 1.0 || std::abs(offset.imag()) > 1.0) {
+            throw std::runtime_error("RX DC offset correction must be finite and within +/-1.0");
+        }
+
+        std::scoped_lock lock(rx_correction_mutex);
+        rx_dc_i = (float)offset.real();
+        rx_dc_q = (float)offset.imag();
+    }
+
+    std::complex<double> getDCOffset(const int direction, const size_t channel) const override
+    {
+        validate_rx_correction_channel(direction, channel);
+        std::scoped_lock lock(rx_correction_mutex);
+        return std::complex<double>(rx_dc_i, rx_dc_q);
+    }
+
+    bool hasIQBalance(const int direction, const size_t channel) const override
+    {
+        (void)channel;
+        return direction == SOAPY_SDR_RX && channel == 0;
+    }
+
+    void setIQBalance(const int direction, const size_t channel, const std::complex<double> &balance) override
+    {
+        validate_rx_correction_channel(direction, channel);
+        if (!std::isfinite(balance.real()) || !std::isfinite(balance.imag()) ||
+            std::abs(balance.real()) > 1.0 || std::abs(balance.imag()) > 1.0) {
+            throw std::runtime_error("RX IQ balance correction must be finite and within +/-1.0");
+        }
+
+        std::scoped_lock lock(rx_correction_mutex);
+        rx_iq_balance = std::complex<float>((float)balance.real(), (float)balance.imag());
+    }
+
+    std::complex<double> getIQBalance(const int direction, const size_t channel) const override
+    {
+        validate_rx_correction_channel(direction, channel);
+        std::scoped_lock lock(rx_correction_mutex);
+        return std::complex<double>(rx_iq_balance.real(), rx_iq_balance.imag());
     }
 
 /***********************************************************************
@@ -1679,6 +1831,16 @@ public:
             "TEMP_REF_RAW",
             "TEMP_SAMPLES",
             "TEMP_SHIFT",
+            "RF_PROFILE",
+            "TX_FILTER_BW",
+            "TX_DAC_BW",
+            "RX_ADC_BW",
+            "RX_ADC_TRIM",
+            "RX_PGA_BW",
+            "RX_DC_I",
+            "RX_DC_Q",
+            "RX_IQ_I",
+            "RX_IQ_Q",
         };
     }
 
@@ -1728,6 +1890,86 @@ public:
         shift.range = SoapySDR::Range(0, 31, 1);
         infos.push_back(shift);
 
+        SoapySDR::ArgInfo rf_profile;
+        rf_profile.key = "RF_PROFILE";
+        rf_profile.name = "RF filter profile";
+        rf_profile.description = "Preset SX1255 TX/RX filter settings. TETRA_CLEAN keeps RF filters wider than the TETRA channel while reducing TX DAC/image noise.";
+        rf_profile.type = SoapySDR::ArgInfo::STRING;
+        rf_profile.options = {"TETRA_CLEAN", "LEGACY"};
+        infos.push_back(rf_profile);
+
+        SoapySDR::ArgInfo tx_filter_bw;
+        tx_filter_bw.key = "TX_FILTER_BW";
+        tx_filter_bw.name = "TX analog filter code";
+        tx_filter_bw.description = "SX1255 TX analog filter bandwidth code from TXFE2 bits 4:0";
+        tx_filter_bw.type = SoapySDR::ArgInfo::INT;
+        tx_filter_bw.range = SoapySDR::Range(0, 31, 1);
+        infos.push_back(tx_filter_bw);
+
+        SoapySDR::ArgInfo tx_dac_bw;
+        tx_dac_bw.key = "TX_DAC_BW";
+        tx_dac_bw.name = "TX DAC FIR bandwidth code";
+        tx_dac_bw.description = "SX1255 TX DAC FIR bandwidth code from TXFE3 bits 2:0";
+        tx_dac_bw.type = SoapySDR::ArgInfo::INT;
+        tx_dac_bw.range = SoapySDR::Range(0, 5, 1);
+        infos.push_back(tx_dac_bw);
+
+        SoapySDR::ArgInfo rx_adc_bw;
+        rx_adc_bw.key = "RX_ADC_BW";
+        rx_adc_bw.name = "RX ADC bandwidth code";
+        rx_adc_bw.description = "SX1255 RX ADC bandwidth code from RXFE2 bits 7:5";
+        rx_adc_bw.type = SoapySDR::ArgInfo::INT;
+        rx_adc_bw.range = SoapySDR::Range(0, 7, 1);
+        infos.push_back(rx_adc_bw);
+
+        SoapySDR::ArgInfo rx_adc_trim;
+        rx_adc_trim.key = "RX_ADC_TRIM";
+        rx_adc_trim.name = "RX ADC trim code";
+        rx_adc_trim.description = "SX1255 RX ADC trim code from RXFE2 bits 4:2";
+        rx_adc_trim.type = SoapySDR::ArgInfo::INT;
+        rx_adc_trim.range = SoapySDR::Range(0, 7, 1);
+        infos.push_back(rx_adc_trim);
+
+        SoapySDR::ArgInfo rx_pga_bw;
+        rx_pga_bw.key = "RX_PGA_BW";
+        rx_pga_bw.name = "RX PGA bandwidth code";
+        rx_pga_bw.description = "SX1255 RX PGA bandwidth code from RXFE2 bits 1:0";
+        rx_pga_bw.type = SoapySDR::ArgInfo::INT;
+        rx_pga_bw.range = SoapySDR::Range(0, 3, 1);
+        infos.push_back(rx_pga_bw);
+
+        SoapySDR::ArgInfo rx_dc_i;
+        rx_dc_i.key = "RX_DC_I";
+        rx_dc_i.name = "RX DC I correction";
+        rx_dc_i.description = "Manual RX I DC correction applied in the SoapySX sample converter";
+        rx_dc_i.type = SoapySDR::ArgInfo::FLOAT;
+        rx_dc_i.range = SoapySDR::Range(-1.0, 1.0, 0.0);
+        infos.push_back(rx_dc_i);
+
+        SoapySDR::ArgInfo rx_dc_q;
+        rx_dc_q.key = "RX_DC_Q";
+        rx_dc_q.name = "RX DC Q correction";
+        rx_dc_q.description = "Manual RX Q DC correction applied in the SoapySX sample converter";
+        rx_dc_q.type = SoapySDR::ArgInfo::FLOAT;
+        rx_dc_q.range = SoapySDR::Range(-1.0, 1.0, 0.0);
+        infos.push_back(rx_dc_q);
+
+        SoapySDR::ArgInfo rx_iq_i;
+        rx_iq_i.key = "RX_IQ_I";
+        rx_iq_i.name = "RX IQ correction real";
+        rx_iq_i.description = "Real part of image correction coefficient applied as y = x + c * conj(x)";
+        rx_iq_i.type = SoapySDR::ArgInfo::FLOAT;
+        rx_iq_i.range = SoapySDR::Range(-1.0, 1.0, 0.0);
+        infos.push_back(rx_iq_i);
+
+        SoapySDR::ArgInfo rx_iq_q;
+        rx_iq_q.key = "RX_IQ_Q";
+        rx_iq_q.name = "RX IQ correction imaginary";
+        rx_iq_q.description = "Imaginary part of image correction coefficient applied as y = x + c * conj(x)";
+        rx_iq_q.type = SoapySDR::ArgInfo::FLOAT;
+        rx_iq_q.range = SoapySDR::Range(-1.0, 1.0, 0.0);
+        infos.push_back(rx_iq_q);
+
         return infos;
     }
 
@@ -1766,6 +2008,35 @@ public:
             temperature_samples = parse_unsigned_setting(value, 16, 4096);
         } else if (key == "TEMP_SHIFT") {
             temperature_shift = parse_unsigned_setting(value, 0, 31);
+        } else if (key == "RF_PROFILE") {
+            set_filter_profile(value);
+        } else if (key == "TX_FILTER_BW") {
+            set_register_bits(SX1255_REG_TXFE2, 0, 5, parse_unsigned_setting(value, 0, 31));
+            write_registers_to_chip(SX1255_REG_TXFE2, 1);
+        } else if (key == "TX_DAC_BW") {
+            set_register_bits(SX1255_REG_TXFE3, 0, 3, parse_unsigned_setting(value, 0, 5));
+            write_registers_to_chip(SX1255_REG_TXFE3, 1);
+        } else if (key == "RX_ADC_BW") {
+            set_register_bits(SX1255_REG_RXFE2, 5, 3, parse_unsigned_setting(value, 0, 7));
+            write_registers_to_chip(SX1255_REG_RXFE2, 1);
+        } else if (key == "RX_ADC_TRIM") {
+            set_register_bits(SX1255_REG_RXFE2, 2, 3, parse_unsigned_setting(value, 0, 7));
+            write_registers_to_chip(SX1255_REG_RXFE2, 1);
+        } else if (key == "RX_PGA_BW") {
+            set_register_bits(SX1255_REG_RXFE2, 0, 2, parse_unsigned_setting(value, 0, 3));
+            write_registers_to_chip(SX1255_REG_RXFE2, 1);
+        } else if (key == "RX_DC_I") {
+            std::scoped_lock correction_lock(rx_correction_mutex);
+            rx_dc_i = parse_correction_setting(value);
+        } else if (key == "RX_DC_Q") {
+            std::scoped_lock correction_lock(rx_correction_mutex);
+            rx_dc_q = parse_correction_setting(value);
+        } else if (key == "RX_IQ_I") {
+            std::scoped_lock correction_lock(rx_correction_mutex);
+            rx_iq_balance = std::complex<float>(parse_correction_setting(value), rx_iq_balance.imag());
+        } else if (key == "RX_IQ_Q") {
+            std::scoped_lock correction_lock(rx_correction_mutex);
+            rx_iq_balance = std::complex<float>(rx_iq_balance.real(), parse_correction_setting(value));
         } else {
             throw std::runtime_error("Unsupported setting");
         }
@@ -1785,6 +2056,30 @@ public:
             return std::to_string(temperature_samples);
         } else if (key == "TEMP_SHIFT") {
             return std::to_string(temperature_shift);
+        } else if (key == "RF_PROFILE") {
+            return get_filter_profile();
+        } else if (key == "TX_FILTER_BW") {
+            return std::to_string(get_cached_register_bits(SX1255_REG_TXFE2, 0, 5));
+        } else if (key == "TX_DAC_BW") {
+            return std::to_string(get_cached_register_bits(SX1255_REG_TXFE3, 0, 3));
+        } else if (key == "RX_ADC_BW") {
+            return std::to_string(get_cached_register_bits(SX1255_REG_RXFE2, 5, 3));
+        } else if (key == "RX_ADC_TRIM") {
+            return std::to_string(get_cached_register_bits(SX1255_REG_RXFE2, 2, 3));
+        } else if (key == "RX_PGA_BW") {
+            return std::to_string(get_cached_register_bits(SX1255_REG_RXFE2, 0, 2));
+        } else if (key == "RX_DC_I") {
+            std::scoped_lock correction_lock(rx_correction_mutex);
+            return format_double(rx_dc_i, 9);
+        } else if (key == "RX_DC_Q") {
+            std::scoped_lock correction_lock(rx_correction_mutex);
+            return format_double(rx_dc_q, 9);
+        } else if (key == "RX_IQ_I") {
+            std::scoped_lock correction_lock(rx_correction_mutex);
+            return format_double(rx_iq_balance.real(), 9);
+        } else if (key == "RX_IQ_Q") {
+            std::scoped_lock correction_lock(rx_correction_mutex);
+            return format_double(rx_iq_balance.imag(), 9);
         }
 
         throw std::runtime_error("Unsupported setting");
