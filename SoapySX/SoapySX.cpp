@@ -7,11 +7,17 @@
 
 #include <string.h>
 #include <cassert>
+#include <algorithm>
 #include <climits>
 #include <chrono>
+#include <cmath>
 #include <fstream>
+#include <iomanip>
+#include <stdexcept>
 #include <thread>
 #include <mutex>
+#include <sstream>
+#include <vector>
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -69,6 +75,22 @@ static uint16_t read_hex_file(const char *filename)
     std::string str;
     std::getline(file, str);
     return std::stoul(str, NULL, 16);
+}
+
+static std::string format_double(double value, int precision = 3)
+{
+    std::ostringstream ss;
+    ss << std::fixed << std::setprecision(precision) << value;
+    return ss.str();
+}
+
+static unsigned parse_unsigned_setting(const std::string &value, unsigned min_value, unsigned max_value)
+{
+    unsigned parsed = std::stoul(value, NULL, 0);
+    if (parsed < min_value || parsed > max_value) {
+        throw std::runtime_error("Setting value out of range");
+    }
+    return parsed;
 }
 
 struct hat_info {
@@ -137,6 +159,12 @@ static inline void convert_tx_buffer(const void *src, size_t src_offset, void *d
 }
 
 #define MAX_REGS 0x80
+
+#define SX1255_REG_RXFE3 0x0E
+#define SX1255_TEMP_DEFAULT_REF_C 25.0
+#define SX1255_TEMP_DEFAULT_REF_RAW 150.0
+#define SX1255_TEMP_DEFAULT_SAMPLES 256
+#define SX1255_TEMP_DEFAULT_SHIFT 23
 
 // Number of initial register values for SX1255.
 // Only write the documented registers from 0x00 to 0x13.
@@ -550,6 +578,13 @@ private:
     float tx_threshold2;
     // If true, RX and TX streams have been linked using snd_pcm_link
     bool linked;
+    // Temperature conversion calibration:
+    // datasheet output is approximately -1 LSB/C, with 150d typical at ambient.
+    double temperature_ref_c;
+    double temperature_ref_raw;
+    unsigned temperature_samples;
+    unsigned temperature_shift;
+    std::string pa_mode;
 
     // Values of registers (to be) written to the chip.
     // Storing them here makes it easier and faster to change
@@ -672,6 +707,96 @@ private:
         setFrequency(SOAPY_SDR_TX, 0, 433.92e6, {});
     }
 
+    struct temperature_measurement {
+        double qout_mean;
+        double raw_code;
+    };
+
+    double raw_temperature_to_c(double raw_code) const
+    {
+        // SX1255 reports approximately -1 LSB/C. The default reference uses
+        // the datasheet typical ambient value, but operators can override both
+        // sides with TEMP_REF_C and TEMP_REF_RAW after a hardware measurement.
+        return temperature_ref_c + (temperature_ref_raw - raw_code);
+    }
+
+    temperature_measurement measure_temperature_adc(void) const
+    {
+        auto *self = const_cast<SoapySX *>(this);
+        std::scoped_lock lock(self->alsa_rx.mutex, self->alsa_tx.mutex, self->reg_mutex);
+
+        if (self->alsa_rx.activated || self->alsa_tx.activated) {
+            throw std::runtime_error("SX1255 temperature sensor requires inactive RX/TX streams");
+        }
+        if (self->alsa_rx.pcm == NULL) {
+            throw std::runtime_error("RX ALSA PCM is not open");
+        }
+
+        if (!self->alsa_rx.setup_done) {
+            self->alsa_rx.configure(temperature_samples);
+        }
+
+        const uint8_t original_rxfe3 = self->regs[SX1255_REG_RXFE3];
+
+        // Keep the current operating mode while switching the RX ADC input to
+        // the temperature sensor. On Raspberry Pi/SXceiver hardware, forcing
+        // standby here can stop the I2S clock and leave ALSA with no samples.
+        self->set_register_bits(SX1255_REG_RXFE3, 0, 1, 1);
+        self->write_registers_to_chip(SX1255_REG_RXFE3, 1);
+
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+
+        std::vector<int32_t> temp_buffer((size_t)temperature_samples * 2, 0);
+        double q_sum = 0.0;
+        size_t q_count = 0;
+
+        try {
+            if (self->alsa_rx.reset() < 0)
+                throw std::runtime_error("Failed to reset RX PCM for temperature measurement");
+            int ret = snd_pcm_start(self->alsa_rx.pcm);
+            if (ret < 0)
+                throw std::runtime_error("Failed to start RX PCM for temperature measurement");
+            ret = snd_pcm_wait(self->alsa_rx.pcm, 1000);
+            if (ret <= 0)
+                throw std::runtime_error("Timed out waiting for temperature samples");
+
+            snd_pcm_sframes_t samples_read = snd_pcm_readi(self->alsa_rx.pcm, temp_buffer.data(), temperature_samples);
+            if (samples_read < 0)
+                throw std::runtime_error("Failed to read RX PCM temperature samples");
+
+            const size_t discard = std::min((size_t)samples_read / 4, (size_t)32);
+            for (size_t i = discard; i < (size_t)samples_read; i++) {
+                q_sum += (double)temp_buffer[i * 2 + 1];
+                q_count++;
+            }
+            if (q_count == 0)
+                throw std::runtime_error("No temperature samples available");
+
+            if (self->alsa_rx.reset() < 0)
+                throw std::runtime_error("Failed to reset RX PCM after temperature measurement");
+        } catch (...) {
+            self->set_register_bits(SX1255_REG_RXFE3, 0, 8, original_rxfe3);
+            self->write_registers_to_chip(SX1255_REG_RXFE3, 1);
+            self->alsa_rx.reset();
+            throw;
+        }
+
+        self->set_register_bits(SX1255_REG_RXFE3, 0, 8, original_rxfe3);
+        self->write_registers_to_chip(SX1255_REG_RXFE3, 1);
+
+        const double qout_mean = q_sum / (double)q_count;
+        const double raw_code = -qout_mean / (double)(1ULL << temperature_shift);
+
+        SoapySDR_logf(
+            SOAPY_SDR_DEBUG,
+            "SX1255 temperature measurement: qout_mean=%.3f raw=%.3f temp=%.3f C",
+            qout_mean,
+            raw_code,
+            raw_temperature_to_c(raw_code));
+
+        return { qout_mean, raw_code };
+    }
+
 /***********************************************************************
  * Initialization and destruction
  **********************************************************************/
@@ -707,6 +832,11 @@ public:
         alsa_tx(AlsaPcm("hw:CARD=SX1255,DEV=0", SND_PCM_STREAM_PLAYBACK)),
         tx_threshold2(0.0f),
         linked(false),
+        temperature_ref_c(SX1255_TEMP_DEFAULT_REF_C),
+        temperature_ref_raw(SX1255_TEMP_DEFAULT_REF_RAW),
+        temperature_samples(SX1255_TEMP_DEFAULT_SAMPLES),
+        temperature_shift(SX1255_TEMP_DEFAULT_SHIFT),
+        pa_mode("AUTO"),
         regs{0},
 
         // Allocate reasonably large buffers by default.
@@ -1147,6 +1277,70 @@ public:
     }
 
 /***********************************************************************
+ * Sensors
+ **********************************************************************/
+
+    std::vector<std::string> listSensors(void) const
+    {
+        return {
+            "temperature",
+            "temperature_raw",
+            "temperature_qout",
+        };
+    }
+
+    SoapySDR::ArgInfo getSensorInfo(const std::string &key) const
+    {
+        SoapySDR::ArgInfo info;
+        info.key = key;
+        info.type = SoapySDR::ArgInfo::FLOAT;
+
+        if (key == "temperature") {
+            info.name = "SX1255 temperature";
+            info.units = "C";
+            info.description =
+                "SX1255 internal temperature estimate. Reading requires inactive streams because the sensor uses the RX ADC path.";
+        } else if (key == "temperature_raw") {
+            info.name = "SX1255 raw temperature ADC";
+            info.units = "LSB";
+            info.description = "Raw SX1255 temperature ADC code derived from Q_OUT.";
+        } else if (key == "temperature_qout") {
+            info.name = "SX1255 temperature Q_OUT mean";
+            info.units = "S32";
+            info.description = "Mean raw signed 32-bit Q_OUT sample measured while rx_adc_temp is enabled.";
+        } else {
+            throw std::runtime_error("Unsupported sensor");
+        }
+
+        return info;
+    }
+
+    std::string readSensor(const std::string &key) const
+    {
+        if (key != "temperature" && key != "temperature_raw" && key != "temperature_qout") {
+            throw std::runtime_error("Unsupported sensor");
+        }
+
+        temperature_measurement measurement;
+        try {
+            measurement = measure_temperature_adc();
+        } catch (const std::exception &e) {
+            SoapySDR_logf(SOAPY_SDR_WARNING, "SX1255 temperature read failed: %s", e.what());
+            return "nan";
+        }
+
+        if (key == "temperature") {
+            return format_double(raw_temperature_to_c(measurement.raw_code), 3);
+        } else if (key == "temperature_raw") {
+            return format_double(measurement.raw_code, 3);
+        } else if (key == "temperature_qout") {
+            return format_double(measurement.qout_mean, 3);
+        }
+
+        return "nan";
+    }
+
+/***********************************************************************
  * Sample rates
  **********************************************************************/
 
@@ -1477,30 +1671,124 @@ public:
  * Other settings
  **********************************************************************/
 
+    std::vector<std::string> listSettings(void) const
+    {
+        return {
+            "PA",
+            "TEMP_REF_C",
+            "TEMP_REF_RAW",
+            "TEMP_SAMPLES",
+            "TEMP_SHIFT",
+        };
+    }
+
+    SoapySDR::ArgInfoList getSettingInfo(void) const
+    {
+        SoapySDR::ArgInfoList infos;
+
+        SoapySDR::ArgInfo pa;
+        pa.key = "PA";
+        pa.name = "PA control";
+        pa.description = "Power amplifier control: ON, OFF, or AUTO";
+        pa.type = SoapySDR::ArgInfo::STRING;
+        pa.options = {"ON", "OFF", "AUTO"};
+        infos.push_back(pa);
+
+        SoapySDR::ArgInfo ref_c;
+        ref_c.key = "TEMP_REF_C";
+        ref_c.name = "Temperature reference";
+        ref_c.description = "Known board temperature in Celsius for SX1255 temperature conversion calibration";
+        ref_c.type = SoapySDR::ArgInfo::FLOAT;
+        ref_c.units = "C";
+        infos.push_back(ref_c);
+
+        SoapySDR::ArgInfo ref_raw;
+        ref_raw.key = "TEMP_REF_RAW";
+        ref_raw.name = "Raw temperature reference";
+        ref_raw.description = "Raw SX1255 temperature ADC code measured at TEMP_REF_C";
+        ref_raw.type = SoapySDR::ArgInfo::FLOAT;
+        ref_raw.units = "LSB";
+        infos.push_back(ref_raw);
+
+        SoapySDR::ArgInfo samples;
+        samples.key = "TEMP_SAMPLES";
+        samples.name = "Temperature sample count";
+        samples.description = "Number of RX Q_OUT samples averaged for each temperature measurement";
+        samples.type = SoapySDR::ArgInfo::INT;
+        samples.units = "samples";
+        samples.range = SoapySDR::Range(16, 4096, 1);
+        infos.push_back(samples);
+
+        SoapySDR::ArgInfo shift;
+        shift.key = "TEMP_SHIFT";
+        shift.name = "Temperature Q_OUT shift";
+        shift.description = "Right shift used to convert mean signed 32-bit Q_OUT samples to raw ADC code";
+        shift.type = SoapySDR::ArgInfo::INT;
+        shift.units = "bits";
+        shift.range = SoapySDR::Range(0, 31, 1);
+        infos.push_back(shift);
+
+        return infos;
+    }
+
     void writeSetting(
         const std::string & key,
         const std::string & value
     )
     {
+        std::scoped_lock lock(reg_mutex);
+
         // PA control modes
         if (key == "PA") {
             if (value == "ON") {
                 // PA always on
                 gpio_tx.set_value(1);
                 gpio_rx.set_value(0);
+                pa_mode = value;
             } else if (value == "OFF") {
                 // PA always off
                 gpio_tx.set_value(0);
                 gpio_rx.set_value(1);
+                pa_mode = value;
             } else if (value == "AUTO") {
                 // PA on/off controlled by TX stream (default)
                 gpio_tx.set_value(1);
                 gpio_rx.set_value(1);
+                pa_mode = value;
+            } else {
+                throw std::runtime_error("Unsupported PA setting");
             }
+        } else if (key == "TEMP_REF_C") {
+            temperature_ref_c = std::stod(value);
+        } else if (key == "TEMP_REF_RAW") {
+            temperature_ref_raw = std::stod(value);
+        } else if (key == "TEMP_SAMPLES") {
+            temperature_samples = parse_unsigned_setting(value, 16, 4096);
+        } else if (key == "TEMP_SHIFT") {
+            temperature_shift = parse_unsigned_setting(value, 0, 31);
+        } else {
+            throw std::runtime_error("Unsupported setting");
         }
     }
 
-    // TODO: readSetting, getSettingInfo
+    std::string readSetting(const std::string & key) const
+    {
+        std::scoped_lock lock(reg_mutex);
+
+        if (key == "PA") {
+            return pa_mode;
+        } else if (key == "TEMP_REF_C") {
+            return format_double(temperature_ref_c, 6);
+        } else if (key == "TEMP_REF_RAW") {
+            return format_double(temperature_ref_raw, 6);
+        } else if (key == "TEMP_SAMPLES") {
+            return std::to_string(temperature_samples);
+        } else if (key == "TEMP_SHIFT") {
+            return std::to_string(temperature_shift);
+        }
+
+        throw std::runtime_error("Unsupported setting");
+    }
 
 /***********************************************************************
  * Low level interfaces

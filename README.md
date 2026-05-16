@@ -25,6 +25,27 @@ Check that the module is found:
 SoapySDRUtil --probe=driver=sx
 ```
 
+Read SX1255 temperature and raw Q_OUT-derived ADC values:
+```
+SoapySDRUtil --probe=driver=sx
+SoapySDRUtil --probe=driver=sx | grep -i temperature
+```
+
+The SX1255 temperature sensor uses the RX ADC path. SoapySX exposes it as
+SoapySDR sensors (`temperature`, `temperature_raw`, `temperature_qout`), but
+refuses the measurement while RX/TX streams are active so applications do not
+get a hidden receive/transmit interruption.
+
+The default conversion uses the datasheet slope of about -1 LSB/degC and the
+typical ambient reference (`TEMP_REF_C=25`, `TEMP_REF_RAW=150`). The SXceiver
+I2S path reports Q_OUT as a signed 32-bit value, so the default raw conversion is
+`-temperature_qout / 2^23`. For accurate absolute values, calibrate the board at
+a known temperature and set:
+```
+TEMP_REF_C=<known temperature C>
+TEMP_REF_RAW=<temperature_raw at that point>
+```
+
 ## Features
 SoapySX provides some support for timestamps which are used by some
 applications to obtain a known timing relationship between transmitted and

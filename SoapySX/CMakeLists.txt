@@ -35,8 +35,8 @@ find_package(Git REQUIRED)
 
 add_custom_command(
     OUTPUT ${VERSION_SOURCE_FILE}
-    COMMAND "${VERSION_SCRIPT}" "${GIT_EXECUTABLE}" > "${VERSION_SOURCE_FILE}"
-    DEPENDS ../.git/index ${VERSION_SCRIPT} ${MY_SOURCE_FILES}
+    COMMAND "${VERSION_SCRIPT}" "${GIT_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/.." > "${VERSION_SOURCE_FILE}"
+    DEPENDS "${CMAKE_SOURCE_DIR}/../.git/index" ${VERSION_SCRIPT} ${MY_SOURCE_FILES}
 )
 
 ########################################################################
