@@ -289,6 +289,7 @@ public:
 
     GpioLine(class GpioChip &chip, __u32 pin_number, const char *name, __u64 flags, bool initial_value)
     {
+        /*
         struct gpio_v2_line_request req = {
             .offsets = { pin_number },
             .consumer = "",
@@ -303,6 +304,13 @@ public:
             .padding = { },
             .fd = 0,
         };
+        */
+        struct gpio_v2_line_request req;
+        ::memset(&req, 0, sizeof(req));
+        req.offsets[0]   = pin_number;
+        req.config.flags = flags;
+        req.num_lines    = 1;
+
         strncpy(req.consumer, name, GPIO_MAX_NAME_SIZE-1);
 
         int ret = ioctl(chip.chip_fd, GPIO_V2_GET_LINE_IOCTL, &req);
