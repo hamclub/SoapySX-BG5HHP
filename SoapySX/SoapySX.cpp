@@ -18,6 +18,7 @@
 #include <thread>
 #include <mutex>
 #include <sstream>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -193,8 +194,17 @@ static inline void convert_tx_buffer(const void *src, size_t src_offset, void *d
 #define SX1255_REG_RXFE3 0x0E
 #define SX1255_TEMP_DEFAULT_REF_C 25.0
 #define SX1255_TEMP_DEFAULT_REF_RAW 150.0
-#define SX1255_TEMP_DEFAULT_SAMPLES 256
+#define SX1255_TEMP_DEFAULT_SAMPLES 1024
 #define SX1255_TEMP_DEFAULT_SHIFT 23
+#define SX1255_TEMP_DISCARD_SAMPLES 256
+#define SX1255_TEMP_SETTLE_MS 20
+#define SX1255_TEMP_MAX_SATURATED_FRACTION 0.05
+#define SX1255_TEMP_MAX_ATTEMPTS 6
+#define SX1255_TEMP_MIN_COHERENT_ATTEMPTS 2
+#define SX1255_TEMP_MAX_COHERENT_SPAN_RAW 8.0
+#define SX1255_TEMP_MIN_VALID_RAW 8.0
+#define SX1255_TEMP_MAX_VALID_RAW 255.0
+#define SX1255_TEMP_CACHE_MS 250
 
 // Number of initial register values for SX1255.
 // Only write the documented registers from 0x00 to 0x13.
@@ -590,6 +600,22 @@ public:
 class SoapySX : public SoapySDR::Device
 {
 private:
+    struct temperature_measurement {
+        double iout_mean;
+        double qout_mean;
+        double i_raw_code;
+        double q_raw_code;
+        double raw_code;
+        char channel;
+        size_t samples;
+        size_t i_samples;
+        size_t q_samples;
+        size_t i_saturated;
+        size_t q_saturated;
+        size_t accepted_attempt;
+        std::chrono::steady_clock::time_point measured_at;
+    };
+
     double masterClock;
     double sampleRate;
 
@@ -614,6 +640,9 @@ private:
     double temperature_ref_raw;
     unsigned temperature_samples;
     unsigned temperature_shift;
+    mutable std::mutex temperature_mutex;
+    mutable bool temperature_cache_valid;
+    mutable temperature_measurement temperature_cache;
     std::string pa_mode;
     mutable std::mutex rx_correction_mutex;
     float rx_dc_i;
@@ -741,11 +770,6 @@ private:
         setFrequency(SOAPY_SDR_TX, 0, 433.92e6, {});
     }
 
-    struct temperature_measurement {
-        double qout_mean;
-        double raw_code;
-    };
-
     double raw_temperature_to_c(double raw_code) const
     {
         // SX1255 reports approximately -1 LSB/C. The default reference uses
@@ -770,65 +794,217 @@ private:
             self->alsa_rx.configure(temperature_samples);
         }
 
+        const uint8_t original_opmode = self->regs[0x00];
         const uint8_t original_rxfe3 = self->regs[SX1255_REG_RXFE3];
 
-        // Keep the current operating mode while switching the RX ADC input to
-        // the temperature sensor. On Raspberry Pi/SXceiver hardware, forcing
-        // standby here can stop the I2S clock and leave ALSA with no samples.
+        // Temperature uses the RX ADC path. Keep RX/I2S alive, but force TX
+        // and PA off so the internal measurement is not polluted by TX leakage.
+        self->set_register_bits(0x00, 1, 3, 0b001);
+        self->write_registers_to_chip(0x00, 1);
         self->set_register_bits(SX1255_REG_RXFE3, 0, 1, 1);
         self->write_registers_to_chip(SX1255_REG_RXFE3, 1);
 
-        std::this_thread::sleep_for(std::chrono::microseconds(200));
+        std::this_thread::sleep_for(std::chrono::milliseconds(SX1255_TEMP_SETTLE_MS));
 
-        std::vector<int32_t> temp_buffer((size_t)temperature_samples * 2, 0);
-        double q_sum = 0.0;
-        size_t q_count = 0;
+        const size_t discard_samples = std::min((size_t)SX1255_TEMP_DISCARD_SAMPLES, (size_t)temperature_samples);
+        const size_t total_samples = (size_t)temperature_samples + discard_samples;
+        std::vector<int32_t> temp_buffer(total_samples * 2, 0);
+        std::vector<temperature_measurement> attempts;
 
         try {
-            if (self->alsa_rx.reset() < 0)
-                throw std::runtime_error("Failed to reset RX PCM for temperature measurement");
-            int ret = snd_pcm_start(self->alsa_rx.pcm);
-            if (ret < 0)
-                throw std::runtime_error("Failed to start RX PCM for temperature measurement");
-            ret = snd_pcm_wait(self->alsa_rx.pcm, 1000);
-            if (ret <= 0)
-                throw std::runtime_error("Timed out waiting for temperature samples");
+            std::string last_error = "No temperature measurement attempted";
+            for (size_t attempt = 1; attempt <= SX1255_TEMP_MAX_ATTEMPTS; attempt++) {
+                std::fill(temp_buffer.begin(), temp_buffer.end(), 0);
+                size_t read_offset = 0;
 
-            snd_pcm_sframes_t samples_read = snd_pcm_readi(self->alsa_rx.pcm, temp_buffer.data(), temperature_samples);
-            if (samples_read < 0)
-                throw std::runtime_error("Failed to read RX PCM temperature samples");
+                if (self->alsa_rx.reset() < 0)
+                    throw std::runtime_error("Failed to reset RX PCM for temperature measurement");
+                int ret = snd_pcm_start(self->alsa_rx.pcm);
+                if (ret < 0)
+                    throw std::runtime_error("Failed to start RX PCM for temperature measurement");
 
-            const size_t discard = std::min((size_t)samples_read / 4, (size_t)32);
-            for (size_t i = discard; i < (size_t)samples_read; i++) {
-                q_sum += (double)temp_buffer[i * 2 + 1];
-                q_count++;
+                while (read_offset < total_samples) {
+                    ret = snd_pcm_wait(self->alsa_rx.pcm, 1000);
+                    if (ret <= 0) {
+                        last_error = "Timed out waiting for temperature samples";
+                        break;
+                    }
+
+                    snd_pcm_sframes_t samples_read = snd_pcm_readi(
+                        self->alsa_rx.pcm,
+                        temp_buffer.data() + read_offset * 2,
+                        total_samples - read_offset);
+                    if (samples_read < 0) {
+                        last_error = "Failed to read RX PCM temperature samples";
+                        break;
+                    }
+                    if (samples_read == 0) {
+                        last_error = "RX PCM returned no temperature samples";
+                        break;
+                    }
+                    read_offset += (size_t)samples_read;
+                }
+
+                if (read_offset < total_samples) {
+                    self->alsa_rx.reset();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    continue;
+                }
+
+                double i_sum = 0.0;
+                double q_sum = 0.0;
+                size_t i_count = 0;
+                size_t q_count = 0;
+                size_t i_saturated = 0;
+                size_t q_saturated = 0;
+
+                for (size_t i = discard_samples; i < read_offset; i++) {
+                    const int32_t iv = temp_buffer[i * 2];
+                    const int32_t q = temp_buffer[i * 2 + 1];
+                    if (iv == INT32_MIN || iv == INT32_MAX) {
+                        i_saturated++;
+                    } else {
+                        i_sum += (double)iv;
+                        i_count++;
+                    }
+                    if (q == INT32_MIN || q == INT32_MAX) {
+                        q_saturated++;
+                    } else {
+                        q_sum += (double)q;
+                        q_count++;
+                    }
+                }
+
+                const double iout_mean = i_count > 0 ? i_sum / (double)i_count : NAN;
+                const double qout_mean = q_count > 0 ? q_sum / (double)q_count : NAN;
+                const double i_raw_candidate = std::abs(iout_mean) / (double)(1ULL << temperature_shift);
+                const double q_raw_candidate = std::abs(qout_mean) / (double)(1ULL << temperature_shift);
+                const size_t measurement_samples = read_offset - discard_samples;
+                const double i_saturated_fraction = (double)i_saturated / (double)measurement_samples;
+                const double q_saturated_fraction = (double)q_saturated / (double)measurement_samples;
+                const bool i_valid =
+                    i_count > 0 &&
+                    i_saturated_fraction <= SX1255_TEMP_MAX_SATURATED_FRACTION &&
+                    i_raw_candidate >= SX1255_TEMP_MIN_VALID_RAW &&
+                    i_raw_candidate <= SX1255_TEMP_MAX_VALID_RAW;
+                const bool q_valid =
+                    q_count > 0 &&
+                    q_saturated_fraction <= SX1255_TEMP_MAX_SATURATED_FRACTION &&
+                    q_raw_candidate >= SX1255_TEMP_MIN_VALID_RAW &&
+                    q_raw_candidate <= SX1255_TEMP_MAX_VALID_RAW;
+                const double i_raw_code = i_valid ? i_raw_candidate : NAN;
+                const double q_raw_code = q_valid ? q_raw_candidate : NAN;
+
+                if (!i_valid && !q_valid) {
+                    last_error = "No coherent non-saturated temperature channel available";
+                    self->alsa_rx.reset();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+                    continue;
+                }
+
+                SoapySDR_logf(
+                    SOAPY_SDR_INFO,
+                    "SX1255 temperature attempt %zu: I mean=%.3f raw=%.3f sat=%zu/%zu Q mean=%.3f raw=%.3f sat=%zu/%zu",
+                    attempt,
+                    iout_mean,
+                    i_raw_code,
+                    i_saturated,
+                    measurement_samples,
+                    qout_mean,
+                    q_raw_code,
+                    q_saturated,
+                    measurement_samples);
+
+                const bool prefer_q = q_valid && (!i_valid || q_raw_code >= i_raw_code);
+                attempts.push_back({
+                    iout_mean,
+                    qout_mean,
+                    i_raw_code,
+                    q_raw_code,
+                    prefer_q ? q_raw_code : i_raw_code,
+                    prefer_q ? 'Q' : 'I',
+                    prefer_q ? q_count : i_count,
+                    i_count,
+                    q_count,
+                    i_saturated,
+                    q_saturated,
+                    attempt,
+                    std::chrono::steady_clock::now()
+                });
             }
-            if (q_count == 0)
-                throw std::runtime_error("No temperature samples available");
+
+            if (attempts.empty())
+                throw std::runtime_error(last_error);
 
             if (self->alsa_rx.reset() < 0)
                 throw std::runtime_error("Failed to reset RX PCM after temperature measurement");
         } catch (...) {
+            self->set_register_bits(0x00, 0, 8, original_opmode);
+            self->write_registers_to_chip(0x00, 1);
             self->set_register_bits(SX1255_REG_RXFE3, 0, 8, original_rxfe3);
             self->write_registers_to_chip(SX1255_REG_RXFE3, 1);
             self->alsa_rx.reset();
             throw;
         }
 
+        self->set_register_bits(0x00, 0, 8, original_opmode);
+        self->write_registers_to_chip(0x00, 1);
         self->set_register_bits(SX1255_REG_RXFE3, 0, 8, original_rxfe3);
         self->write_registers_to_chip(SX1255_REG_RXFE3, 1);
 
-        const double qout_mean = q_sum / (double)q_count;
-        const double raw_code = -qout_mean / (double)(1ULL << temperature_shift);
+        auto coherent = [](std::vector<double> raw_codes) {
+            if (raw_codes.size() < SX1255_TEMP_MIN_COHERENT_ATTEMPTS)
+                return std::pair<bool, double>(false, NAN);
+            std::sort(raw_codes.begin(), raw_codes.end());
+            const double span = raw_codes.back() - raw_codes.front();
+            const double median = raw_codes[raw_codes.size() / 2];
+            return std::pair<bool, double>(span <= SX1255_TEMP_MAX_COHERENT_SPAN_RAW, median);
+        };
+
+        std::vector<double> i_raw_codes;
+        std::vector<double> q_raw_codes;
+        for (const auto &attempt : attempts) {
+            if (!std::isnan(attempt.i_raw_code))
+                i_raw_codes.push_back(attempt.i_raw_code);
+            if (!std::isnan(attempt.q_raw_code))
+                q_raw_codes.push_back(attempt.q_raw_code);
+        }
+        const auto i_coherent = coherent(i_raw_codes);
+        const auto q_coherent = coherent(q_raw_codes);
+        if (!i_coherent.first && !q_coherent.first)
+            throw std::runtime_error("Temperature attempts were not coherent");
+
+        const bool use_q = q_coherent.first && (!i_coherent.first || q_coherent.second >= i_coherent.second);
+        const double selected_raw = use_q ? q_coherent.second : i_coherent.second;
+        temperature_measurement selected = attempts.back();
+        for (const auto &attempt : attempts) {
+            const double attempt_raw = use_q ? attempt.q_raw_code : attempt.i_raw_code;
+            if (!std::isnan(attempt_raw) && std::abs(attempt_raw - selected_raw) <= SX1255_TEMP_MAX_COHERENT_SPAN_RAW) {
+                selected = attempt;
+                break;
+            }
+        }
+        selected.raw_code = selected_raw;
+        selected.channel = use_q ? 'Q' : 'I';
+        selected.samples = use_q ? selected.q_samples : selected.i_samples;
+        selected.measured_at = std::chrono::steady_clock::now();
 
         SoapySDR_logf(
-            SOAPY_SDR_DEBUG,
-            "SX1255 temperature measurement: qout_mean=%.3f raw=%.3f temp=%.3f C",
-            qout_mean,
-            raw_code,
-            raw_temperature_to_c(raw_code));
+            SOAPY_SDR_INFO,
+            "SX1255 temperature selected: channel=%c raw=%.3f temp=%.3f C attempts=%zu I_coherent=%d Q_coherent=%d samples=%zu discarded=%zu I_sat=%zu Q_sat=%zu source_attempt=%zu",
+            selected.channel,
+            selected.raw_code,
+            raw_temperature_to_c(selected.raw_code),
+            attempts.size(),
+            i_coherent.first ? 1 : 0,
+            q_coherent.first ? 1 : 0,
+            selected.samples,
+            discard_samples,
+            selected.i_saturated,
+            selected.q_saturated,
+            selected.accepted_attempt);
 
-        return { qout_mean, raw_code };
+        return selected;
     }
 
     void set_filter_profile(const std::string &profile)
@@ -921,6 +1097,8 @@ public:
         temperature_ref_raw(SX1255_TEMP_DEFAULT_REF_RAW),
         temperature_samples(SX1255_TEMP_DEFAULT_SAMPLES),
         temperature_shift(SX1255_TEMP_DEFAULT_SHIFT),
+        temperature_cache_valid(false),
+        temperature_cache{},
         pa_mode("AUTO"),
         rx_dc_i(0.0f),
         rx_dc_q(0.0f),
@@ -1382,6 +1560,10 @@ public:
         return {
             "temperature",
             "temperature_raw",
+            "temperature_channel",
+            "temperature_i_raw",
+            "temperature_iout",
+            "temperature_q_raw",
             "temperature_qout",
         };
     }
@@ -1400,6 +1582,22 @@ public:
         } else if (key == "temperature_raw") {
             info.name = "SX1255 raw temperature ADC";
             info.units = "LSB";
+            info.description = "Selected coherent raw SX1255 temperature ADC code.";
+        } else if (key == "temperature_channel") {
+            info.name = "SX1255 temperature channel";
+            info.type = SoapySDR::ArgInfo::STRING;
+            info.description = "ADC lane selected for the coherent SX1255 temperature reading.";
+        } else if (key == "temperature_i_raw") {
+            info.name = "SX1255 I raw temperature ADC";
+            info.units = "LSB";
+            info.description = "Raw SX1255 temperature ADC code derived from I_OUT.";
+        } else if (key == "temperature_iout") {
+            info.name = "SX1255 temperature I_OUT mean";
+            info.units = "S32";
+            info.description = "Mean raw signed 32-bit I_OUT sample measured while rx_adc_temp is enabled.";
+        } else if (key == "temperature_q_raw") {
+            info.name = "SX1255 Q raw temperature ADC";
+            info.units = "LSB";
             info.description = "Raw SX1255 temperature ADC code derived from Q_OUT.";
         } else if (key == "temperature_qout") {
             info.name = "SX1255 temperature Q_OUT mean";
@@ -1414,13 +1612,30 @@ public:
 
     std::string readSensor(const std::string &key) const
     {
-        if (key != "temperature" && key != "temperature_raw" && key != "temperature_qout") {
+        if (
+            key != "temperature" &&
+            key != "temperature_raw" &&
+            key != "temperature_channel" &&
+            key != "temperature_i_raw" &&
+            key != "temperature_iout" &&
+            key != "temperature_q_raw" &&
+            key != "temperature_qout"
+        ) {
             throw std::runtime_error("Unsupported sensor");
         }
 
         temperature_measurement measurement;
         try {
-            measurement = measure_temperature_adc();
+            std::scoped_lock cache_lock(temperature_mutex);
+            const auto now = std::chrono::steady_clock::now();
+            if (
+                !temperature_cache_valid ||
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - temperature_cache.measured_at).count() > SX1255_TEMP_CACHE_MS
+            ) {
+                temperature_cache = measure_temperature_adc();
+                temperature_cache_valid = true;
+            }
+            measurement = temperature_cache;
         } catch (const std::exception &e) {
             SoapySDR_logf(SOAPY_SDR_WARNING, "SX1255 temperature read failed: %s", e.what());
             return "nan";
@@ -1430,6 +1645,14 @@ public:
             return format_double(raw_temperature_to_c(measurement.raw_code), 3);
         } else if (key == "temperature_raw") {
             return format_double(measurement.raw_code, 3);
+        } else if (key == "temperature_channel") {
+            return std::string(1, measurement.channel);
+        } else if (key == "temperature_i_raw") {
+            return format_double(measurement.i_raw_code, 3);
+        } else if (key == "temperature_iout") {
+            return format_double(measurement.iout_mean, 3);
+        } else if (key == "temperature_q_raw") {
+            return format_double(measurement.q_raw_code, 3);
         } else if (key == "temperature_qout") {
             return format_double(measurement.qout_mean, 3);
         }
