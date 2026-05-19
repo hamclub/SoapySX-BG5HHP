@@ -33,10 +33,17 @@ set(VERSION_SCRIPT "${CMAKE_SOURCE_DIR}/version.sh")
 
 find_package(Git REQUIRED)
 
+if(NOT DEFINED SOAPYSDR_SX_TAG)
+    set(SOAPYSDR_SX_TAG "unknown")
+endif()
+if(NOT DEFINED SOAPYSDR_SX_COMMIT)
+    set(SOAPYSDR_SX_COMMIT "unknown")
+endif()
+
 add_custom_command(
     OUTPUT ${VERSION_SOURCE_FILE}
-    COMMAND "${VERSION_SCRIPT}" "${GIT_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/.." > "${VERSION_SOURCE_FILE}"
-    DEPENDS "${CMAKE_SOURCE_DIR}/../.git/index" ${VERSION_SCRIPT} ${MY_SOURCE_FILES}
+    COMMAND "${VERSION_SCRIPT}" "${GIT_EXECUTABLE}" "${CMAKE_SOURCE_DIR}/.." "${SOAPYSDR_SX_TAG}" "${SOAPYSDR_SX_COMMIT}" > "${VERSION_SOURCE_FILE}"
+    DEPENDS ${VERSION_SCRIPT} ${MY_SOURCE_FILES}
 )
 
 ########################################################################
