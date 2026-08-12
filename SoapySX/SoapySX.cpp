@@ -150,6 +150,13 @@ static inline void convert_rx_buffer(
     const float coeff_i = iq_coeff.real();
     const float coeff_q = iq_coeff.imag();
 
+    if (dc_i == 0.0f && dc_q == 0.0f && coeff_i == 0.0f && coeff_q == 0.0f) {
+        for (size_t i = 0; i < length*2; i++) {
+            dest_[i] = scaling * (float)src_[i];
+        }
+        return;
+    }
+
     for (size_t i = 0; i < length*2; i += 2)
     {
         const float in_i = scaling * (float)src_[i] - dc_i;
@@ -163,14 +170,53 @@ static inline void convert_rx_buffer(
 
 // Convert CF32 to raw transmit samples.
 // TODO: Support other formats and add format as a parameter.
-static inline void convert_tx_buffer(const void *src, size_t src_offset, void *dest, size_t dest_offset, size_t length, float tx_threshold2)
+static inline void convert_tx_buffer(
+    const void *src,
+    size_t src_offset,
+    void *dest,
+    size_t dest_offset,
+    size_t length,
+    float tx_threshold2,
+    float dc_i,
+    float dc_q,
+    std::complex<float> iq_coeff
+)
 {
     const float *src_ = (const float*)src + src_offset*2;
     int32_t *dest_ = (int32_t*)dest + dest_offset*2;
     const float scaling = (float)0x7FFFFFFFL;
+    const float coeff_i = iq_coeff.real();
+    const float coeff_q = iq_coeff.imag();
+    const bool apply_correction = dc_i != 0.0f || dc_q != 0.0f || coeff_i != 0.0f || coeff_q != 0.0f;
+
+    if (!apply_correction) {
+        for (size_t i = 0; i < length*2; i+=2)
+        {
+            float fi = src_[i], fq = src_[i+1];
+            int32_t vi = scaling * std::max(std::min(fi, 1.0f), -1.0f);
+            int32_t vq = scaling * std::max(std::min(fq, 1.0f), -1.0f);
+            // Second lowest bit of each "I" sample controls RX/TX switching.
+            // Set the lowest bit to the same value just in case.
+            // Let's also reserve the 2 lowest bits of "Q" samples
+            // for future extensions and keep them as 0.
+            vi &= 0xFFFFFFFCL;
+            vq &= 0xFFFFFFFCL;
+            if (fi*fi + fq*fq >= tx_threshold2)
+                vi |= 0b11L;
+            dest_[i  ] = vi;
+            dest_[i+1] = vq;
+        }
+        return;
+    }
+
     for (size_t i = 0; i < length*2; i+=2)
     {
-        float fi = src_[i], fq = src_[i+1];
+        const float src_i = src_[i], src_q = src_[i+1];
+        float fi = src_i, fq = src_q;
+
+        fi = src_i + coeff_i * src_i + coeff_q * src_q + dc_i;
+        fq = src_q + coeff_q * src_i - coeff_i * src_q + dc_q;
+
         int32_t vi = scaling * std::max(std::min(fi, 1.0f), -1.0f);
         int32_t vq = scaling * std::max(std::min(fq, 1.0f), -1.0f);
         // Second lowest bit of each "I" sample controls RX/TX switching.
@@ -179,7 +225,7 @@ static inline void convert_tx_buffer(const void *src, size_t src_offset, void *d
         // for future extensions and keep them as 0.
         vi &= 0xFFFFFFFCL;
         vq &= 0xFFFFFFFCL;
-        if (fi*fi + fq*fq >= tx_threshold2)
+        if (src_i*src_i + src_q*src_q >= tx_threshold2)
             vi |= 0b11L;
         dest_[i  ] = vi;
         dest_[i+1] = vq;
@@ -648,6 +694,10 @@ private:
     float rx_dc_i;
     float rx_dc_q;
     std::complex<float> rx_iq_balance;
+    mutable std::mutex tx_correction_mutex;
+    float tx_dc_i;
+    float tx_dc_q;
+    std::complex<float> tx_iq_balance;
 
     // Values of registers (to be) written to the chip.
     // Storing them here makes it easier and faster to change
@@ -1048,13 +1098,13 @@ private:
         return "CUSTOM";
     }
 
-    void validate_rx_correction_channel(const int direction, const size_t channel) const
+    void validate_correction_channel(const int direction, const size_t channel) const
     {
-        if (direction != SOAPY_SDR_RX) {
-            throw std::runtime_error("RX correction is only supported for RX direction");
+        if (direction != SOAPY_SDR_RX && direction != SOAPY_SDR_TX) {
+            throw std::runtime_error("Correction is only supported for RX or TX direction");
         }
         if (channel != 0) {
-            throw std::runtime_error("Invalid RX correction channel");
+            throw std::runtime_error("Invalid correction channel");
         }
     }
 
@@ -1103,6 +1153,9 @@ public:
         rx_dc_i(0.0f),
         rx_dc_q(0.0f),
         rx_iq_balance(0.0f, 0.0f),
+        tx_dc_i(0.0f),
+        tx_dc_q(0.0f),
+        tx_iq_balance(0.0f, 0.0f),
         regs{0},
 
         // Allocate reasonably large buffers by default.
@@ -1500,7 +1553,16 @@ public:
         if (length > buffer_tx.size())
             buffer_tx.resize(length);
 
-        convert_tx_buffer(buffs[0], 0, buffer_tx.data(), 0, length, tx_threshold2);
+        float dc_i;
+        float dc_q;
+        std::complex<float> iq_balance;
+        {
+            std::scoped_lock correction_lock(tx_correction_mutex);
+            dc_i = tx_dc_i;
+            dc_q = tx_dc_q;
+            iq_balance = tx_iq_balance;
+        }
+        convert_tx_buffer(buffs[0], 0, buffer_tx.data(), 0, length, tx_threshold2, dc_i, dc_q, iq_balance);
 
         if (length > 0) {
             snd_pcm_sframes_t samples_written = snd_pcm_writei(pcm, buffer_tx.data(), length);
@@ -1661,58 +1723,77 @@ public:
     }
 
 /***********************************************************************
- * RX correction
+ * RX/TX correction
  **********************************************************************/
 
     bool hasDCOffset(const int direction, const size_t channel) const override
     {
-        (void)channel;
-        return direction == SOAPY_SDR_RX && channel == 0;
+        return (direction == SOAPY_SDR_RX || direction == SOAPY_SDR_TX) && channel == 0;
     }
 
     void setDCOffset(const int direction, const size_t channel, const std::complex<double> &offset) override
     {
-        validate_rx_correction_channel(direction, channel);
+        validate_correction_channel(direction, channel);
         if (!std::isfinite(offset.real()) || !std::isfinite(offset.imag()) ||
             std::abs(offset.real()) > 1.0 || std::abs(offset.imag()) > 1.0) {
-            throw std::runtime_error("RX DC offset correction must be finite and within +/-1.0");
+            throw std::runtime_error("DC offset correction must be finite and within +/-1.0");
         }
 
-        std::scoped_lock lock(rx_correction_mutex);
-        rx_dc_i = (float)offset.real();
-        rx_dc_q = (float)offset.imag();
+        if (direction == SOAPY_SDR_RX) {
+            std::scoped_lock lock(rx_correction_mutex);
+            rx_dc_i = (float)offset.real();
+            rx_dc_q = (float)offset.imag();
+        } else {
+            std::scoped_lock lock(tx_correction_mutex);
+            tx_dc_i = (float)offset.real();
+            tx_dc_q = (float)offset.imag();
+        }
     }
 
     std::complex<double> getDCOffset(const int direction, const size_t channel) const override
     {
-        validate_rx_correction_channel(direction, channel);
-        std::scoped_lock lock(rx_correction_mutex);
-        return std::complex<double>(rx_dc_i, rx_dc_q);
+        validate_correction_channel(direction, channel);
+        if (direction == SOAPY_SDR_RX) {
+            std::scoped_lock lock(rx_correction_mutex);
+            return std::complex<double>(rx_dc_i, rx_dc_q);
+        } else {
+            std::scoped_lock lock(tx_correction_mutex);
+            return std::complex<double>(tx_dc_i, tx_dc_q);
+        }
     }
 
     bool hasIQBalance(const int direction, const size_t channel) const override
     {
-        (void)channel;
-        return direction == SOAPY_SDR_RX && channel == 0;
+        return (direction == SOAPY_SDR_RX || direction == SOAPY_SDR_TX) && channel == 0;
     }
 
     void setIQBalance(const int direction, const size_t channel, const std::complex<double> &balance) override
     {
-        validate_rx_correction_channel(direction, channel);
+        validate_correction_channel(direction, channel);
         if (!std::isfinite(balance.real()) || !std::isfinite(balance.imag()) ||
             std::abs(balance.real()) > 1.0 || std::abs(balance.imag()) > 1.0) {
-            throw std::runtime_error("RX IQ balance correction must be finite and within +/-1.0");
+            throw std::runtime_error("IQ balance correction must be finite and within +/-1.0");
         }
 
-        std::scoped_lock lock(rx_correction_mutex);
-        rx_iq_balance = std::complex<float>((float)balance.real(), (float)balance.imag());
+        if (direction == SOAPY_SDR_RX) {
+            std::scoped_lock lock(rx_correction_mutex);
+            rx_iq_balance = std::complex<float>((float)balance.real(), (float)balance.imag());
+        } else {
+            std::scoped_lock lock(tx_correction_mutex);
+            tx_iq_balance = std::complex<float>((float)balance.real(), (float)balance.imag());
+        }
     }
 
     std::complex<double> getIQBalance(const int direction, const size_t channel) const override
     {
-        validate_rx_correction_channel(direction, channel);
-        std::scoped_lock lock(rx_correction_mutex);
-        return std::complex<double>(rx_iq_balance.real(), rx_iq_balance.imag());
+        validate_correction_channel(direction, channel);
+        if (direction == SOAPY_SDR_RX) {
+            std::scoped_lock lock(rx_correction_mutex);
+            return std::complex<double>(rx_iq_balance.real(), rx_iq_balance.imag());
+        } else {
+            std::scoped_lock lock(tx_correction_mutex);
+            return std::complex<double>(tx_iq_balance.real(), tx_iq_balance.imag());
+        }
     }
 
 /***********************************************************************
@@ -2064,6 +2145,10 @@ public:
             "RX_DC_Q",
             "RX_IQ_I",
             "RX_IQ_Q",
+            "TX_DC_I",
+            "TX_DC_Q",
+            "TX_IQ_I",
+            "TX_IQ_Q",
         };
     }
 
@@ -2193,6 +2278,38 @@ public:
         rx_iq_q.range = SoapySDR::Range(-1.0, 1.0, 0.0);
         infos.push_back(rx_iq_q);
 
+        SoapySDR::ArgInfo tx_dc_i;
+        tx_dc_i.key = "TX_DC_I";
+        tx_dc_i.name = "TX DC I predistortion";
+        tx_dc_i.description = "Manual TX I DC predistortion added in the SoapySX sample converter before quantization";
+        tx_dc_i.type = SoapySDR::ArgInfo::FLOAT;
+        tx_dc_i.range = SoapySDR::Range(-1.0, 1.0, 0.0);
+        infos.push_back(tx_dc_i);
+
+        SoapySDR::ArgInfo tx_dc_q;
+        tx_dc_q.key = "TX_DC_Q";
+        tx_dc_q.name = "TX DC Q predistortion";
+        tx_dc_q.description = "Manual TX Q DC predistortion added in the SoapySX sample converter before quantization";
+        tx_dc_q.type = SoapySDR::ArgInfo::FLOAT;
+        tx_dc_q.range = SoapySDR::Range(-1.0, 1.0, 0.0);
+        infos.push_back(tx_dc_q);
+
+        SoapySDR::ArgInfo tx_iq_i;
+        tx_iq_i.key = "TX_IQ_I";
+        tx_iq_i.name = "TX IQ predistortion real";
+        tx_iq_i.description = "Real part of TX image predistortion coefficient applied as y = x + c * conj(x)";
+        tx_iq_i.type = SoapySDR::ArgInfo::FLOAT;
+        tx_iq_i.range = SoapySDR::Range(-1.0, 1.0, 0.0);
+        infos.push_back(tx_iq_i);
+
+        SoapySDR::ArgInfo tx_iq_q;
+        tx_iq_q.key = "TX_IQ_Q";
+        tx_iq_q.name = "TX IQ predistortion imaginary";
+        tx_iq_q.description = "Imaginary part of TX image predistortion coefficient applied as y = x + c * conj(x)";
+        tx_iq_q.type = SoapySDR::ArgInfo::FLOAT;
+        tx_iq_q.range = SoapySDR::Range(-1.0, 1.0, 0.0);
+        infos.push_back(tx_iq_q);
+
         return infos;
     }
 
@@ -2260,6 +2377,18 @@ public:
         } else if (key == "RX_IQ_Q") {
             std::scoped_lock correction_lock(rx_correction_mutex);
             rx_iq_balance = std::complex<float>(rx_iq_balance.real(), parse_correction_setting(value));
+        } else if (key == "TX_DC_I") {
+            std::scoped_lock correction_lock(tx_correction_mutex);
+            tx_dc_i = parse_correction_setting(value);
+        } else if (key == "TX_DC_Q") {
+            std::scoped_lock correction_lock(tx_correction_mutex);
+            tx_dc_q = parse_correction_setting(value);
+        } else if (key == "TX_IQ_I") {
+            std::scoped_lock correction_lock(tx_correction_mutex);
+            tx_iq_balance = std::complex<float>(parse_correction_setting(value), tx_iq_balance.imag());
+        } else if (key == "TX_IQ_Q") {
+            std::scoped_lock correction_lock(tx_correction_mutex);
+            tx_iq_balance = std::complex<float>(tx_iq_balance.real(), parse_correction_setting(value));
         } else {
             throw std::runtime_error("Unsupported setting");
         }
@@ -2303,6 +2432,18 @@ public:
         } else if (key == "RX_IQ_Q") {
             std::scoped_lock correction_lock(rx_correction_mutex);
             return format_double(rx_iq_balance.imag(), 9);
+        } else if (key == "TX_DC_I") {
+            std::scoped_lock correction_lock(tx_correction_mutex);
+            return format_double(tx_dc_i, 9);
+        } else if (key == "TX_DC_Q") {
+            std::scoped_lock correction_lock(tx_correction_mutex);
+            return format_double(tx_dc_q, 9);
+        } else if (key == "TX_IQ_I") {
+            std::scoped_lock correction_lock(tx_correction_mutex);
+            return format_double(tx_iq_balance.real(), 9);
+        } else if (key == "TX_IQ_Q") {
+            std::scoped_lock correction_lock(tx_correction_mutex);
+            return format_double(tx_iq_balance.imag(), 9);
         }
 
         throw std::runtime_error("Unsupported setting");
