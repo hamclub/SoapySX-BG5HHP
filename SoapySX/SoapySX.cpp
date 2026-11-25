@@ -236,6 +236,7 @@ static inline void convert_tx_buffer(
 
 #define SX1255_REG_TXFE2 0x0A
 #define SX1255_REG_TXFE3 0x0B
+#define SX1255_REG_RXFE1 0x0C
 #define SX1255_REG_RXFE2 0x0D
 #define SX1255_REG_RXFE3 0x0E
 #define SX1255_TEMP_DEFAULT_REF_C 25.0
@@ -1059,7 +1060,7 @@ private:
 
     void set_filter_profile(const std::string &profile)
     {
-        if (profile == "TETRA_CLEAN") {
+        if (profile == "RF_BW_W") {
             // Keep hardware filters much wider than a 25 kHz TETRA channel.
             // FlowStation's DSP defines the occupied channel; these settings
             // reduce wideband TX DAC/image energy without live gain changes.
@@ -1070,7 +1071,7 @@ private:
             set_register_bits(SX1255_REG_RXFE2, 0, 2, 3);
             write_registers_to_chip(SX1255_REG_TXFE2, 2);
             write_registers_to_chip(SX1255_REG_RXFE2, 1);
-        } else if (profile == "LEGACY") {
+        } else if (profile == "RF_BW_N") {
             set_register_bits(SX1255_REG_TXFE2, 0, 5, 16);
             set_register_bits(SX1255_REG_TXFE3, 0, 3, 2);
             set_register_bits(SX1255_REG_RXFE2, 5, 3, 1);
@@ -1092,9 +1093,9 @@ private:
         const unsigned rx_pga_bw = get_cached_register_bits(SX1255_REG_RXFE2, 0, 2);
 
         if (tx_filter_bw == 0 && tx_dac_bw == 5 && rx_adc_bw == 1 && rx_adc_trim == 6 && rx_pga_bw == 3)
-            return "TETRA_CLEAN";
+            return "RF_BW_W";
         if (tx_filter_bw == 16 && tx_dac_bw == 2 && rx_adc_bw == 1 && rx_adc_trim == 6 && rx_pga_bw == 3)
-            return "LEGACY";
+            return "RF_BW_N";
         return "CUSTOM";
     }
 
@@ -1172,6 +1173,16 @@ public:
         reset_chip();
         init_chip();
         detect_clock();
+
+        // handle args
+        if (args.count("RX_ZIN") > 0) {
+            writeSetting("RX_ZIN", args.at("RX_ZIN"));
+        }
+
+        if (args.count("RF_PROFILE") > 0) {
+            writeSetting("RF_PROFILE", args.at("RF_PROFILE"));
+        }
+
         // Open ALSA devices now when I2S clocks are already running.
         // I am not sure if this makes any difference but just in case.
         alsa_rx.open();
@@ -1978,16 +1989,16 @@ public:
                 // LNA gain does not have a constant step,
                 // so some extra logic is needed.
                 if (quantized <= 6) // -48 to -12 dB
-                    set_register_bits(0x0C, 5, 3, 6-quantized/2);
+                    set_register_bits(SX1255_REG_RXFE1, 5, 3, 6-quantized/2);
                 else if (quantized == 7) // -6 dB
-                    set_register_bits(0x0C, 5, 3, 2);
+                    set_register_bits(SX1255_REG_RXFE1, 5, 3, 2);
                 else // 0 dB
-                    set_register_bits(0x0C, 5, 3, 1);
+                    set_register_bits(SX1255_REG_RXFE1, 5, 3, 1);
             } else if (name == "PGA") {
-                set_register_bits(0x0C, 1, 4, quantized);
+                set_register_bits(SX1255_REG_RXFE1, 1, 4, quantized);
             }
-            SoapySDR_logf(SOAPY_SDR_DEBUG, "RXFE1=0x%02x", regs[0x0C]);
-            write_registers_to_chip(0x0C, 1);
+            SoapySDR_logf(SOAPY_SDR_DEBUG, "RXFE1=0x%02x", regs[SX1255_REG_RXFE1]);
+            write_registers_to_chip(SX1255_REG_RXFE1, 1);
         } else {
             if (name == "DAC") {
                 set_register_bits(0x08, 4, 3, quantized);
@@ -2011,9 +2022,9 @@ public:
         if (direction == SOAPY_SDR_RX) {
             if (name == "LNA") {
                 const int32_t map[8] = {0, 8, 7, 6, 4, 2, 0, 0};
-                quantized = map[get_cached_register_bits(0x0C, 5, 3)];
+                quantized = map[get_cached_register_bits(SX1255_REG_RXFE1, 5, 3)];
             } else if (name == "PGA") {
-                quantized = get_cached_register_bits(0x0C, 1, 4);
+                quantized = get_cached_register_bits(SX1255_REG_RXFE1, 1, 4);
             }
         } else {
             if (name == "DAC") {
@@ -2141,6 +2152,7 @@ public:
             "RX_ADC_BW",
             "RX_ADC_TRIM",
             "RX_PGA_BW",
+            "RX_ZIN",
             "RX_DC_I",
             "RX_DC_Q",
             "RX_IQ_I",
@@ -2201,9 +2213,9 @@ public:
         SoapySDR::ArgInfo rf_profile;
         rf_profile.key = "RF_PROFILE";
         rf_profile.name = "RF filter profile";
-        rf_profile.description = "Preset SX1255 TX/RX filter settings. TETRA_CLEAN keeps RF filters wider than the TETRA channel while reducing TX DAC/image noise.";
+        rf_profile.description = "Preset SX1255 TX/RX filter settings. RF_BW_W keeps RF filters wider than the TETRA channel while reducing TX DAC/image noise.";
         rf_profile.type = SoapySDR::ArgInfo::STRING;
-        rf_profile.options = {"TETRA_CLEAN", "LEGACY"};
+        rf_profile.options = {"RF_BW_W", "RF_BW_N"};
         infos.push_back(rf_profile);
 
         SoapySDR::ArgInfo tx_filter_bw;
@@ -2245,6 +2257,15 @@ public:
         rx_pga_bw.type = SoapySDR::ArgInfo::INT;
         rx_pga_bw.range = SoapySDR::Range(0, 3, 1);
         infos.push_back(rx_pga_bw);
+
+        SoapySDR::ArgInfo rx_zin;
+        rx_zin.key = "RX_ZIN";
+        rx_zin.name = "RX LNA input impedance";
+        rx_zin.description = "SX1255 RX LNA input impedance in Ohms from RXFE1 bit 0: 50 or 200";
+        rx_zin.type = SoapySDR::ArgInfo::STRING;
+        rx_zin.units = "Ohm";
+        rx_zin.options = {"50", "200"};
+        infos.push_back(rx_zin);
 
         SoapySDR::ArgInfo rx_dc_i;
         rx_dc_i.key = "RX_DC_I";
@@ -2350,6 +2371,17 @@ public:
             temperature_shift = parse_unsigned_setting(value, 0, 31);
         } else if (key == "RF_PROFILE") {
             set_filter_profile(value);
+        } else if (key == "RX_ZIN") {
+            if (value == "50") {
+                set_register_bits(SX1255_REG_RXFE1, 0, 1, 0);
+                write_registers_to_chip(SX1255_REG_RXFE1, 1);
+            } else if (value == "200") {
+                set_register_bits(SX1255_REG_RXFE1, 0, 1, 1);
+                write_registers_to_chip(SX1255_REG_RXFE1, 1);
+            } else {
+                // ignore incorrect values
+                // throw std::runtime_error("Unsupported RX_ZIN setting");
+            }
         } else if (key == "TX_FILTER_BW") {
             set_register_bits(SX1255_REG_TXFE2, 0, 5, parse_unsigned_setting(value, 0, 31));
             write_registers_to_chip(SX1255_REG_TXFE2, 1);
@@ -2410,6 +2442,8 @@ public:
             return std::to_string(temperature_shift);
         } else if (key == "RF_PROFILE") {
             return get_filter_profile();
+        } else if (key == "RX_ZIN") {
+            return get_cached_register_bits(SX1255_REG_RXFE1, 0, 1) ? "200" : "50";
         } else if (key == "TX_FILTER_BW") {
             return std::to_string(get_cached_register_bits(SX1255_REG_TXFE2, 0, 5));
         } else if (key == "TX_DAC_BW") {
